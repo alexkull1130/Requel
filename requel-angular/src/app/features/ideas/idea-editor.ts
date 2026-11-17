@@ -36,8 +36,7 @@ import { AnnouncerService } from '../../core/announcer.service';
 import { ConfirmDialogModule } from 'primeng/confirmdialog';
 import { ConfirmationService, MessageService } from 'primeng/api';
 import { CommandResult } from '../../models/command';
-import { IdeaDto, ClarificationDto } from '../../models/requirement';
-import { EntityReferenceDto } from '../../models/entity-reference';
+import { BreakdownAction, BreakdownProposal, IdeaDto, ClarificationDto } from '../../models/requirement';
 import { RequirementService } from '../../core/requirement.service';
 import { CommandService, isNetworkError } from '../../core/command.service';
 import { ProjectService } from '../../core/project.service';
@@ -158,25 +157,33 @@ const STALE_VERSION_MESSAGE =
         </app-card>
 
         <!-- Breakdown Review (UC-03) -->
-        <app-card *ngIf="idea()?.status === 'BREAKDOWN_REVIEW'" class="breakdown-card">
+        <app-card *ngIf="idea()?.canReviewBreakdown" class="breakdown-card">
           <h2 class="rq-section-title">Review AI Breakdown</h2>
           <p class="text-muted">Review each proposed requirement. Choose Keep, Reject, or Revise.</p>
+          <p-button label="Reject all" severity="secondary" [outlined]="true"
+                    [disabled]="submittingBreakdown()" (onClick)="rejectAll()" />
           @for (req of derivedRequirements(); track req.id) {
             <div class="breakdown-item">
               <div class="breakdown-header">
                 <span class="breakdown-id">{{ req.requirementId }}</span>
-                <p-select [(ngModel)]="breakdownDecisions[req.id]" [options]="breakdownActions"
+                <p-select [(ngModel)]="breakdownDecisions[req.id]" [options]="breakdownActions" optionValue="value"
+                          [ariaLabel]="'Decision for ' + req.requirementId" placeholder="Choose action"
+                          [disabled]="submittingBreakdown()"
                           [style]="{ width: '10rem' }" />
               </div>
               <div class="breakdown-text">{{ req.shallText }}</div>
               <div class="breakdown-revised" *ngIf="breakdownDecisions[req.id] === 'REVISE'">
-                <textarea pTextarea [(ngModel)]="revisedTexts[req.id]" rows="2" placeholder="Revised shall statement..."></textarea>
+                <textarea pTextarea [(ngModel)]="revisedTexts[req.id]" [disabled]="submittingBreakdown()"
+                          [attr.aria-label]="'Revised statement for ' + req.requirementId" rows="2" placeholder="Revised shall statement..."></textarea>
               </div>
+              <label [for]="'feedback-' + req.id">Feedback (optional)</label>
+              <textarea pTextarea [id]="'feedback-' + req.id" [(ngModel)]="feedback[req.id]"
+                        [disabled]="submittingBreakdown()" rows="2"></textarea>
             </div>
           }
           <div class="form-actions">
             <p-button label="Submit Breakdown Review" icon="pi pi-check" severity="success"
-                      (onClick)="submitBreakdownReview()" [loading]="submittingBreakdown()" />
+                      (onClick)="confirmBreakdownReview()" [disabled]="!canSubmitBreakdown()" [loading]="submittingBreakdown()" />
           </div>
         </app-card>
 
@@ -243,14 +250,22 @@ const STALE_VERSION_MESSAGE =
       <ng-template #breakdownSection>
         <app-card>
           <h3 class="rq-section-title">AI Breakdown</h3>
-          @if (idea()?.status === 'SUBMITTED' || idea()?.status === 'CLARIFYING') {
+          @if (idea()?.status === 'SUBMITTED' && idea()?.generationId) {
+            <p class="text-muted">Idea submitted for generation.</p>
+            <p-button label="Check for proposals" (onClick)="retryLoad()" />
+          } @else if (idea()?.status === 'SUBMITTED') {
+            <p class="text-muted">Idea saved. AI generation was not started.</p>
+          } @else if (idea()?.status === 'CLARIFYING') {
             <p class="text-muted">Run AI decomposition to generate draft requirements.</p>
             <p-button label="Run Decomposition" icon="pi pi-magic" severity="info"
                       (onClick)="runDecomposition()" [loading]="decomposing()" />
           } @else if (idea()?.status === 'BREAKDOWN_REVIEW') {
-            <p class="text-muted">Breakdown review in progress. Complete the review above.</p>
-          } @else {
-            <p class="text-muted">Breakdown complete. See derived requirements below.</p>
+            <p class="text-muted">Awaiting product manager review.</p>
+            @if (isNew() && idea()?.canReviewBreakdown) {
+              <p-button label="Open review" (onClick)="onWizardFinished()" />
+            }
+          } @else if (idea()?.status === 'COMPLETE') {
+            <p class="text-muted">Breakdown review complete.</p>
           }
         </app-card>
       </ng-template>
@@ -271,6 +286,8 @@ const STALE_VERSION_MESSAGE =
     .breakdown-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
     .breakdown-id { font-family: monospace; font-weight: 600; color: var(--p-primary-color); }
     .breakdown-text { font-style: italic; color: var(--p-text-secondary-color); }
+    .breakdown-item label { display: block; margin-top: 0.75rem; }
+    .breakdown-item textarea { width: 100%; }
     .breakdown-revised { margin-top: 0.5rem; }
     .derived-card { margin-top: 1.5rem; }
     .req-text-cell { max-width: 40rem; }
@@ -303,9 +320,10 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
   submitted = signal(false);
   updateAvailable = signal(false);
   clarifications = signal<ClarificationDto[]>([]);
-  derivedRequirements = signal<any[]>([]);
+  derivedRequirements = computed(() => this.idea()?.derivedRequirements ?? []);
   clarificationAnswers: Record<number, string> = {};
-  breakdownDecisions: Record<number, 'KEEP' | 'REJECT' | 'REVISE'> = {};
+  breakdownDecisions: Record<number, BreakdownAction> = {};
+  feedback: Record<number, string> = {};
   revisedTexts: Record<number, string> = {};
   decomposing = signal(false);
   submittingBreakdown = signal(false);
@@ -346,6 +364,7 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
       const idParam = params.get('ideaId') ?? '';
       const newIsNew = this.route.snapshot.routeConfig?.path === 'new' || idParam === 'new';
 
+      this.clearReviewInputs();
       if (newIsNew) {
         this.isNew.set(true);
         this.idea.set(null);
@@ -369,7 +388,14 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
   }
 
   hasUnsavedChanges(): boolean {
-    return this.detailsForm.dirty;
+    return this.detailsForm.dirty || Object.keys(this.breakdownDecisions).length > 0
+      || Object.values(this.feedback).some(text => !!text);
+  }
+
+  private clearReviewInputs(): void {
+    this.breakdownDecisions = {};
+    this.revisedTexts = {};
+    this.feedback = {};
   }
 
   ngOnDestroy(): void {
@@ -386,6 +412,7 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
   async reloadFromExternalChange(): Promise<void> {
     this.updateAvailable.set(false);
     this.detailsForm.markAsPristine();
+    this.clearReviewInputs();
     await this.loadIdea(false);
     this.announcer.announce('Idea reloaded.');
   }
@@ -402,7 +429,6 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
       this.version = idea.version;
       // Clarifications are not in the current IdeaDto model - using empty array
       this.clarifications.set([]);
-      this.derivedRequirements.set(idea.derivedRequirements ?? []);
       if (!this.hasUnsavedChanges()) {
         this.ideaName.set(idea.externalId ?? 'Idea #' + idea.id);
         this.detailsForm.reset({ sourceText: idea.sourceText });
@@ -423,11 +449,11 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
           return;
         }
         const dirty = this.hasUnsavedChanges();
-        void this.loadIdea(false);
         if (dirty) {
           this.updateAvailable.set(true);
           this.announcer.announce('This idea was changed elsewhere. Your unsaved changes are preserved.');
         } else {
+          void this.loadIdea(false);
           this.announcer.announceThrottled('Idea:' + this.ideaId, 'This idea was updated.');
         }
       });
@@ -573,19 +599,46 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
     }
   }
 
-  async submitBreakdownReview(): Promise<void> {
-    if (!this.ideaId) return;
+  rejectAll(): void {
+    for (const draft of this.derivedRequirements()) this.breakdownDecisions[draft.id] = 'REJECT';
+  }
+
+  canSubmitBreakdown(): boolean {
+    const drafts = this.derivedRequirements();
+    return !!this.idea()?.canReviewBreakdown && !this.submittingBreakdown() && drafts.length > 0
+      && drafts.every(({ id }) => this.breakdownDecisions[id]
+        && (this.breakdownDecisions[id] !== 'REVISE' || !!this.revisedTexts[id]?.trim()));
+  }
+
+  confirmBreakdownReview(): void {
+    if (!this.canSubmitBreakdown()) return;
+    const counts: Record<BreakdownAction, number> = { KEEP: 0, REJECT: 0, REVISE: 0 };
+    for (const { id } of this.derivedRequirements()) counts[this.breakdownDecisions[id]]++;
+    this.confirmationService.confirm({
+      header: 'Submit breakdown review?',
+      message: `Keep ${counts.KEEP}, reject ${counts.REJECT}, revise ${counts.REVISE}. Submitting completes the idea.`,
+      acceptLabel: 'Submit review',
+      rejectLabel: 'Back to review',
+      accept: () => void this.submitBreakdownReview()
+    });
+  }
+
+  private async submitBreakdownReview(): Promise<void> {
+    if (!this.ideaId || !this.canSubmitBreakdown()) return;
     this.submittingBreakdown.set(true);
     try {
-      const decisions = Object.entries(this.breakdownDecisions).map(([reqId, action]) => ({
-        requirementId: +reqId,
-        action,
-        revisedText: action === 'REVISE' ? this.revisedTexts[+reqId] : undefined
+      this.showError(null);
+      const decisions = this.derivedRequirements().map(({ id, version }) => ({
+        requirementId: id, version,
+        action: this.breakdownDecisions[id],
+        feedback: this.feedback[id]?.trim() || undefined,
+        revisedText: this.breakdownDecisions[id] === 'REVISE' ? this.revisedTexts[id].trim() : undefined
       }));
       const result = await this.requirementService.reviewBreakdown(this.projectName, this.ideaId, decisions);
+      this.clearReviewInputs();
       this.idea.set(result);
-      this.messageService.add({ severity: 'success', summary: 'Breakdown Review Submitted', detail: 'Derived requirements created.' });
-      await this.loadIdea(false);
+      this.version = result.version;
+      this.messageService.add({ severity: 'success', summary: 'Breakdown review saved' });
     } catch (e: any) {
       this.showError('Breakdown review failed: ' + (e.error?.message ?? e.message));
     } finally {
@@ -593,7 +646,7 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
     }
   }
 
-  onDerivedClick(req: any): void {
+  onDerivedClick(req: BreakdownProposal): void {
     this.router.navigate(['/projects', this.projectName, 'requirements', req.id]);
   }
 

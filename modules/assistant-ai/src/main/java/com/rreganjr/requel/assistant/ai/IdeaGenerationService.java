@@ -115,6 +115,30 @@ public class IdeaGenerationService {
 			Instant updatedAt) {
 	}
 
+	/**
+	 * Callback interface for generation completion notifications.
+	 * Implementations are invoked when a generation run succeeds or fails.
+	 */
+	public interface GenerationCallback {
+		/**
+		 * Called when generation completes successfully with drafts.
+		 * @param ideaId the generation idea ID
+		 * @param drafts the generated drafts
+		 * @param summary the model's summary
+		 * @param messages the model's messages
+		 * @param problems the validation problems
+		 */
+		void onSuccess(String ideaId, List<Draft> drafts, String summary,
+				List<AssistantMessage> messages, List<Problem> problems);
+
+		/**
+		 * Called when generation fails or is skipped.
+		 * @param ideaId the generation idea ID
+		 * @param errorSummary the error or skip reason
+		 */
+		void onFailure(String ideaId, String errorSummary);
+	}
+
 	private final IdeaToRequirementsService ideaService;
 	private final IdeaRepository ideas;
 	private final IdeaDraftRepository drafts;
@@ -125,6 +149,8 @@ public class IdeaGenerationService {
 	private final TransactionOperations required;
 	/** Always its own transaction: the writes made from the executor thread. */
 	private final TransactionOperations requiresNew;
+	/** Optional callback for generation completion. */
+	private GenerationCallback callback;
 
 	@Autowired
 	public IdeaGenerationService(IdeaToRequirementsService ideaService, IdeaRepository ideas,
@@ -149,6 +175,15 @@ public class IdeaGenerationService {
 		this.clock = Objects.requireNonNull(clock, "clock");
 	}
 
+	/**
+	 * Sets the callback for generation completion notifications.
+	 * @param callback the callback, or null to disable
+	 */
+	@Autowired(required = false)
+	public void setGenerationCallback(GenerationCallback callback) {
+		this.callback = callback;
+	}
+
 	private static TransactionOperations template(PlatformTransactionManager manager,
 			int propagation) {
 		TransactionTemplate template = new TransactionTemplate(
@@ -167,6 +202,19 @@ public class IdeaGenerationService {
 	 * @throws IllegalArgumentException if the project or the text is missing
 	 */
 	public String submit(Long projectId, UserRef user, Idea idea) {
+		return submit(projectId, user, idea, null);
+	}
+
+	/**
+	 * Save {@code idea} for {@code projectId} and queue its generation with a callback.
+	 *
+	 * @param user who submitted it
+	 * @param idea the text, and the names the project already has
+	 * @param callback optional callback for completion notification
+	 * @return the saved idea's id
+	 * @throws IllegalArgumentException if the project or the text is missing
+	 */
+	public String submit(Long projectId, UserRef user, Idea idea, GenerationCallback callback) {
 		if (projectId == null) {
 			throw new IllegalArgumentException("An idea belongs to a project");
 		}
@@ -181,7 +229,7 @@ public class IdeaGenerationService {
 		IdeaEntity entity = new IdeaEntity(UUID.randomUUID(), projectId, user.userId(),
 				user.username(), idea.ideaText().strip(), names, clock.instant());
 		required.executeWithoutResult(status -> ideas.save(entity));
-		schedule(entity.getId());
+		schedule(entity.getId(), callback);
 		return entity.getId();
 	}
 
@@ -193,13 +241,25 @@ public class IdeaGenerationService {
 	 * @throws IllegalStateException if the idea is not retryable (already drafted, or running)
 	 */
 	public void retry(String ideaId) {
+		retry(ideaId, null);
+	}
+
+	/**
+	 * Run generation for an idea that failed or was skipped, again, with a callback.
+	 *
+	 * @param ideaId the idea to retry
+	 * @param callback optional callback for completion notification
+	 * @throws IllegalArgumentException if there is no such idea
+	 * @throws IllegalStateException if the idea is not retryable
+	 */
+	public void retry(String ideaId, GenerationCallback callback) {
 		IdeaEntity idea = ideas.findById(ideaId)
 				.orElseThrow(() -> new IllegalArgumentException("No such idea: " + ideaId));
 		if (!retryable(idea)) {
 			throw new IllegalStateException("The idea is " + idea.getStatus()
 					+ "; only a failed or skipped idea can be retried");
 		}
-		schedule(ideaId);
+		schedule(ideaId, callback);
 	}
 
 	/** The idea and its drafts, or empty when there is no such idea. */
@@ -223,6 +283,16 @@ public class IdeaGenerationService {
 	 * on the idea.
 	 */
 	public void run(String ideaId) {
+		run(ideaId, callback);
+	}
+
+	/**
+	 * One generation attempt with a callback.
+	 *
+	 * @param ideaId the idea to run
+	 * @param callback optional callback for completion notification
+	 */
+	public void run(String ideaId, GenerationCallback callback) {
 		Instant now = clock.instant();
 		UUID runId = UUID.randomUUID();
 		Integer claimed = requiresNew.execute(
@@ -247,42 +317,43 @@ public class IdeaGenerationService {
 					EntityRef.of("Project", idea.getProjectId()), IdeaToRequirements.TASK_TYPE,
 					Locale.ROOT, clock, Map.of());
 			IdeaRequirementsDrafts result = ideaService.draft(context, input);
-			store(ideaId, runId, result);
+			store(ideaId, runId, result, callback);
 		} catch (AssistantException | RuntimeException e) {
 			log.warn("Idea {} generation failed (run {}): {}", ideaId, runId, e.getMessage(), e);
-			fail(ideaId, runId, e.getMessage() == null ? e.toString() : e.getMessage());
+			fail(ideaId, runId, e.getMessage() == null ? e.toString() : e.getMessage(), callback);
 		}
 	}
 
 	// ---- scheduling ------------------------------------------------------
 
 	/** Queue {@link #run}; inside a caller's transaction, only once it has committed. */
-	private void schedule(String ideaId) {
+	private void schedule(String ideaId, GenerationCallback callback) {
+		GenerationCallback effectiveCallback = callback != null ? callback : this.callback;
 		if (TransactionSynchronizationManager.isSynchronizationActive()) {
 			TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
 				@Override
 				public void afterCommit() {
-					submitTask(ideaId);
+					submitTask(ideaId, effectiveCallback);
 				}
 			});
 		} else {
-			submitTask(ideaId);
+			submitTask(ideaId, effectiveCallback);
 		}
 	}
 
-	private void submitTask(String ideaId) {
+	private void submitTask(String ideaId, GenerationCallback callback) {
 		try {
-			taskExecutor.execute(() -> run(ideaId));
+			taskExecutor.execute(() -> run(ideaId, callback));
 		} catch (TaskRejectedException e) {
 			// otherwise the idea would sit PENDING with nothing to run it
 			log.warn("Idea {} generation was rejected by the executor: {}", ideaId, e.getMessage());
-			fail(ideaId, null, "The server is busy; retry in a moment.");
+			fail(ideaId, null, "The server is busy; retry in a moment.", callback);
 		}
 	}
 
 	// ---- storing the outcome ---------------------------------------------
 
-	private void store(String ideaId, UUID runId, IdeaRequirementsDrafts result) {
+	private void store(String ideaId, UUID runId, IdeaRequirementsDrafts result, GenerationCallback callback) {
 		requiresNew.executeWithoutResult(status -> {
 			IdeaEntity idea = ideas.findById(ideaId).orElse(null);
 			if (!ownsAttempt(idea, runId)) {
@@ -311,11 +382,19 @@ public class IdeaGenerationService {
 			}
 			idea.setUpdatedAt(now);
 			ideas.save(idea);
+			// The workflow drafts and the generation outcome must commit together.
+			if (callback != null) {
+				if (result.skipped()) {
+					callback.onFailure(ideaId, result.skippedReason());
+				} else {
+					callback.onSuccess(ideaId, result.drafts(), result.summary(), result.messages(), result.problems());
+				}
+			}
 		});
 	}
 
 	/** @param runId the attempt that failed, or null when no attempt started (a rejected task) */
-	private void fail(String ideaId, UUID runId, String message) {
+	private void fail(String ideaId, UUID runId, String message, GenerationCallback callback) {
 		try {
 			requiresNew.executeWithoutResult(status -> {
 				IdeaEntity idea = ideas.findById(ideaId).orElse(null);
@@ -327,6 +406,7 @@ public class IdeaGenerationService {
 				idea.setErrorSummary(truncate(message, ERROR_SUMMARY_LENGTH));
 				idea.setUpdatedAt(clock.instant());
 				ideas.save(idea);
+				if (callback != null) callback.onFailure(ideaId, message);
 			});
 		} catch (RuntimeException e) {
 			log.error("Could not record the failure of idea {}: {}", ideaId, e.getMessage(), e);

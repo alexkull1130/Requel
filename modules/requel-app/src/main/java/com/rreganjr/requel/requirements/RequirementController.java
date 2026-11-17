@@ -1,10 +1,14 @@
 package com.rreganjr.requel.requirements;
 
 import com.rreganjr.platform.command.AuthorizationException;
+import com.rreganjr.requel.assistant.ai.IdeaGenerationService;
+import com.rreganjr.requel.assistant.ai.IdeaToRequirementsService;
+import com.rreganjr.requel.assistant.api.UserRef;
 import com.rreganjr.requel.project.*;
 import com.rreganjr.requel.project.Requirement.*;
 import com.rreganjr.requel.project.impl.IdeaImpl;
 import com.rreganjr.requel.project.impl.RequirementImpl;
+import com.rreganjr.requel.project.impl.RequirementImpl.BreakdownAction;
 import com.rreganjr.requel.service.auth.CurrentUserResolver;
 import com.rreganjr.requel.service.audit.CommandAuditLog;
 import com.rreganjr.requel.service.command.IdeaFileText;
@@ -14,6 +18,9 @@ import com.rreganjr.requel.user.impl.SystemAdminUserRole;
 import jakarta.persistence.*;
 import java.time.Instant;
 import java.util.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.lang.Nullable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
@@ -26,17 +33,27 @@ import org.springframework.web.server.ResponseStatusException;
 @RequestMapping("/api/requirements")
 @Transactional
 public class RequirementController {
+    private static final Logger log = LoggerFactory.getLogger(RequirementController.class);
     @PersistenceContext private EntityManager em;
     private final ProjectRepository projects;
     private final CurrentUserResolver users;
-    public RequirementController(ProjectRepository projects, CurrentUserResolver users) {
-        this.projects = projects; this.users = users;
+    private final IdeaGenerationService ideaGenerationService;
+
+    public RequirementController(ProjectRepository projects, CurrentUserResolver users,
+            @Nullable IdeaGenerationService ideaGenerationService) {
+        this.projects = projects;
+        this.users = users;
+        this.ideaGenerationService = ideaGenerationService;
     }
     public record Create(Long ideaId, String shallText, String requirementId) { }
     public record Edit(String shallText, Long version, String requirementId) { }
     public record Version(Long version) { }
     public record ReviewRequest(Department department, Result result, String comments, Long version) { }
     public record Submit(String sourceText) { }
+    /** One proposal identified by its database ID and optionally its displayed version. */
+    public record Decision(Long requirementId, BreakdownAction action, String revisedText, String feedback, Long version) { }
+    /** Complete set of decisions for one idea. */
+    public record BreakdownReview(List<Decision> decisions) { }
     private record Caller(Project project, User user) { }
 
     private Caller caller(String name, String permission, Class<?> type) {
@@ -109,14 +126,24 @@ public class RequirementController {
         }).toList());
         return v;
     }
-    private Map<String, Object> ideaView(IdeaImpl i) {
+    private Map<String, Object> ideaView(Caller c, IdeaImpl i) {
         Map<String, Object> v = new LinkedHashMap<>();
         v.put("id", i.getId()); v.put("version", i.getVersion()); v.put("externalId", null);
         v.put("sourceText", i.getText()); v.put("status", i.getStatus());
         v.put("createdBy", i.getCreatedBy() == null ? null : i.getCreatedBy().getUsername());
         v.put("createdAt", i.getDateCreated());
-        v.put("derivedRequirements", i.getDerivedRequirements().stream().map(r -> Map.of(
-            "id", r.getId(), "name", "REQ-" + r.getId(), "type", "Requirement")).toList());
+        v.put("generationId", i.getGenerationId());
+        v.put("canReviewBreakdown", i.getStatus() == Idea.Status.BREAKDOWN_REVIEW && manager(c)
+            && StakeholderAuthorizationChecker.isSatisfied(c.project, c.user, Project.class, "Edit"));
+        v.put("derivedRequirements", i.getDerivedRequirementsInternal().stream()
+            .sorted(Comparator.comparing(RequirementImpl::getId)).map(r -> {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("id", r.getId()); row.put("name", "REQ-" + r.getId()); row.put("type", "Requirement");
+                row.put("requirementId", r.getRequirementCode()); row.put("version", r.getVersion());
+                row.put("shallText", r.getShallText()); row.put("status", r.getStatus());
+                row.put("breakdownAction", r.getBreakdownAction()); row.put("feedback", r.getBreakdownFeedback());
+                return row;
+            }).toList());
         return v;
     }
     @GetMapping
@@ -184,12 +211,13 @@ public class RequirementController {
     public List<Map<String, Object>> ideas(@RequestParam String projectName) {
         Caller c = caller(projectName, null, null);
         return em.createQuery("select i from IdeaImpl i where i.projectId = :p order by i.id desc", IdeaImpl.class)
-            .setParameter("p", c.project.getId()).getResultList().stream().map(this::ideaView).toList();
+            .setParameter("p", c.project.getId()).getResultList().stream().map(i -> ideaView(c, i)).toList();
     }
     @GetMapping("/ideas/{id}")
     @Transactional(readOnly = true)
     public Map<String, Object> getIdea(@RequestParam String projectName, @PathVariable long id) {
-        return ideaView(idea(caller(projectName, null, null), id));
+        Caller c = caller(projectName, null, null);
+        return ideaView(c, idea(c, id));
     }
     @PostMapping(value = "/ideas", consumes = "application/json")
     public Map<String, Object> submit(@RequestParam String projectName, @RequestBody Submit body) {
@@ -205,7 +233,59 @@ public class RequirementController {
         Caller c = caller(projectName, "Edit", Project.class);
         if (text == null || text.strip().length() < 10) throw new IllegalArgumentException("An idea needs at least 10 characters.");
         IdeaImpl i = new IdeaImpl(c.project.getId(), text.strip(), filename, c.user);
-        em.persist(i); em.flush(); audit(c, "SubmitWorkflowIdea", i.getId()); return ideaView(i);
+        em.persist(i);
+        if (ideaGenerationService != null) {
+            var input = new IdeaToRequirementsService.Idea(i.getText(), List.of(), List.of(), List.of());
+            var user = new UserRef(c.user.getId(), c.user.getUsername());
+            try {
+                i.setGenerationId(ideaGenerationService.submit(c.project.getId(), user, input));
+            } catch (RuntimeException e) {
+                log.warn("Could not queue generation for workflow idea {}", i.getId(), e);
+            }
+        }
+        em.flush();
+        audit(c, "SubmitWorkflowIdea", i.getId());
+        return ideaView(c, i);
+    }
+
+    /** Apply the PM's decisions and complete the idea in the same transaction as the audit. */
+    @PostMapping("/ideas/{id}/breakdown-review")
+    public Map<String, Object> reviewBreakdown(@RequestParam String projectName, @PathVariable long id,
+            @RequestBody BreakdownReview body) {
+        Caller c = caller(projectName, "Edit", Project.class);
+        if (!manager(c)) throw new AuthorizationException("Only product managers can review a breakdown.");
+        IdeaImpl idea = idea(c, id);
+        if (idea.getStatus() != Idea.Status.BREAKDOWN_REVIEW)
+            throw new IllegalStateException("This idea is not awaiting breakdown review.");
+
+        Map<Long, Decision> decisions = new HashMap<>();
+        if (body == null || body.decisions() == null || body.decisions().isEmpty())
+            throw new IllegalArgumentException("Review each proposal before submitting.");
+        for (Decision decision : body.decisions()) {
+            if (decision == null || decision.requirementId() == null || decision.action() == null
+                    || decisions.putIfAbsent(decision.requirementId(), decision) != null)
+                throw new IllegalArgumentException("Provide one decision per requirement.");
+            if (decision.action() == BreakdownAction.REVISE &&
+                    (decision.revisedText() == null || decision.revisedText().isBlank()))
+                throw new IllegalArgumentException("Enter a revised statement for each revision.");
+        }
+        var drafts = idea.getDerivedRequirementsInternal();
+        if (drafts.size() != decisions.size()) throw new IllegalArgumentException("Review every proposal for this idea.");
+        for (RequirementImpl draft : drafts) {
+            Decision decision = decisions.get(draft.getId());
+            if (decision == null || !draft.getProjectId().equals(c.project.getId()))
+                throw new IllegalArgumentException("The submitted proposals do not match this idea.");
+            if (draft.getStatus() != Status.DRAFT) throw new IllegalStateException("A proposal is no longer a draft.");
+            if (decision.version() != null) version(draft, decision.version());
+        }
+        for (RequirementImpl draft : drafts) {
+            Decision decision = decisions.get(draft.getId());
+            draft.reviewBreakdown(decision.action(), decision.revisedText(), decision.feedback());
+        }
+        idea.setStatus(Idea.Status.COMPLETE);
+        audit(c, "ReviewBreakdown", id);
+        em.flush();
+        return ideaView(c, idea);
     }
     @PostMapping("/{id}/publish")
     public void publish(@RequestParam String projectName, @PathVariable long id, @RequestBody Version body) {
@@ -219,7 +299,7 @@ public class RequirementController {
         caller(projectName, null, null);
         throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Jama search is not configured.");
     }
-    @PostMapping({"/{id}/compare", "/comparisons/{id}/resolve", "/ideas/{id}/breakdown-review", "/ideas/clarifications/{id}/answer"})
+    @PostMapping({"/{id}/compare", "/comparisons/{id}/resolve", "/ideas/clarifications/{id}/answer"})
     public void unconfigured(@RequestParam String projectName, @PathVariable long id) {
         caller(projectName, "Edit", Project.class);
         throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,

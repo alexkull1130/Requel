@@ -16,6 +16,8 @@ public class RequirementImpl implements Requirement {
     @Column(name = "requirement_code", length = 255) private String requirementCode;
     @Lob @Column(name = "shall_text", nullable = false) private String shallText;
     @Enumerated(EnumType.STRING) @Column(nullable = false) private Status status = Status.DRAFT;
+    @Enumerated(EnumType.STRING) @Column(name = "breakdown_action") private BreakdownAction breakdownAction;
+    @Lob @Column(name = "breakdown_feedback") private String breakdownFeedback;
     @Column(name = "created_by", nullable = false) private String createdBy;
     @Column(name = "created_at", nullable = false) private Instant createdAt;
     @Column(name = "updated_at", nullable = false) private Instant updatedAt;
@@ -48,6 +50,24 @@ public class RequirementImpl implements Requirement {
             touch();
         }
     }
+    /** The product manager's decision about a generated draft. */
+    public enum BreakdownAction { KEEP, REJECT, REVISE }
+
+    /** Record a decision while preserving this requirement's link to its source idea. */
+    public void reviewBreakdown(BreakdownAction action, String revisedText, String feedback) {
+        if (status != Status.DRAFT) throw new IllegalStateException("Only drafts can be reviewed in a breakdown.");
+        switch (action) {
+            case REVISE -> revise(revisedText);
+            case REJECT -> status = Status.REJECTED;
+            case KEEP -> { /* Keep the original draft. */ }
+        }
+        breakdownAction = action;
+        breakdownFeedback = feedback == null || feedback.isBlank() ? null : feedback.strip();
+        touch();
+    }
+    public BreakdownAction getBreakdownAction() { return breakdownAction; }
+    public String getBreakdownFeedback() { return breakdownFeedback; }
+
     public void review(Department department, Result result, String comments, String username, String role) {
         if (status != Status.DRAFT && status != Status.IN_REVIEW && status != Status.REJECTED)
             throw new IllegalStateException("Reopen this requirement before reviewing it.");

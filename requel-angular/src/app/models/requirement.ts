@@ -67,6 +67,26 @@ export interface RequirementDto {
   isPublished: boolean;
 }
 
+export type BreakdownAction = 'KEEP' | 'REJECT' | 'REVISE';
+
+export interface BreakdownDecision {
+  requirementId: number;
+  action: BreakdownAction;
+  version: number;
+  revisedText?: string;
+  feedback?: string;
+}
+
+export interface BreakdownProposal {
+  id: number;
+  version: number;
+  requirementId: string;
+  shallText: string;
+  status: RequirementStatus;
+  breakdownAction: BreakdownAction | null;
+  feedback: string | null;
+}
+
 /** Idea that spawns requirements (UC-01..03). */
 export interface IdeaDto {
   id: number;
@@ -76,7 +96,9 @@ export interface IdeaDto {
   status: 'SUBMITTED' | 'CLARIFYING' | 'BREAKDOWN_REVIEW' | 'COMPLETE';
   createdBy: string | null;
   createdAt: string;
-  derivedRequirements: EntityReferenceDto[] | null;
+  generationId: string | null;
+  canReviewBreakdown: boolean;
+  derivedRequirements: BreakdownProposal[] | null;
 }
 
 /** Clarification question on an idea (UC-02). */

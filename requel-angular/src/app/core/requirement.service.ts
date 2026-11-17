@@ -22,7 +22,7 @@ import { Injectable } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import { environment } from '../../environments/environment';
-import { RequirementDto, IdeaDto, ClarificationDto, OverlapComparisonDto, RequirementStatus } from '../models/requirement';
+import { BreakdownDecision, RequirementDto, IdeaDto, ClarificationDto, OverlapComparisonDto, RequirementStatus } from '../models/requirement';
 
 @Injectable({ providedIn: 'root' })
 export class RequirementService {
@@ -121,7 +121,7 @@ export class RequirementService {
   }
 
   /** Review breakdown: keep/reject/revise derived requirements (UC-03). */
-  async reviewBreakdown(projectName: string, ideaId: number, decisions: Array<{ requirementId: number; action: 'KEEP' | 'REJECT' | 'REVISE'; revisedText?: string }>): Promise<IdeaDto> {
+  async reviewBreakdown(projectName: string, ideaId: number, decisions: BreakdownDecision[]): Promise<IdeaDto> {
     const params = new HttpParams().set('projectName', projectName);
     return firstValueFrom(this.http.post<IdeaDto>(`${this.base}/ideas/${ideaId}/breakdown-review`, { decisions }, { params }));
   }

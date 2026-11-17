@@ -57,6 +57,7 @@ public class IdeaImpl implements Idea {
 	private Status status = Status.SUBMITTED;
 	private User createdBy;
 	private Date dateCreated;
+	private String generationId;
 
 	    @jakarta.persistence.Version
     public long getVersion() { return version; }
@@ -157,5 +158,14 @@ public class IdeaImpl implements Idea {
 
 	protected void setDateCreated(Date dateCreated) {
 		this.dateCreated = dateCreated;
+	}
+
+	@Column(name = "generation_id", length = 36)
+	public String getGenerationId() {
+		return generationId;
+	}
+
+	public void setGenerationId(String generationId) {
+		this.generationId = generationId;
 	}
 }
