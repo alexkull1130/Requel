@@ -69,6 +69,12 @@ export interface RequirementDto {
 
 export type BreakdownAction = 'KEEP' | 'REJECT' | 'REVISE';
 
+export interface AiRevisionPreview {
+  revisedShall: string;
+  ideaVersion: number;
+  requirementVersion: number;
+}
+
 export interface BreakdownDecision {
   requirementId: number;
   action: BreakdownAction;

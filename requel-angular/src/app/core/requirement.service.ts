@@ -22,7 +22,7 @@ import { Injectable } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import { environment } from '../../environments/environment';
-import { BreakdownDecision, RequirementDto, IdeaDto, ClarificationDto, OverlapComparisonDto, RequirementStatus } from '../models/requirement';
+import { AiRevisionPreview, BreakdownDecision, RequirementDto, IdeaDto, ClarificationDto, OverlapComparisonDto, RequirementStatus } from '../models/requirement';
 
 @Injectable({ providedIn: 'root' })
 export class RequirementService {
@@ -118,6 +118,12 @@ export class RequirementService {
   async answerClarification(projectName: string, clarificationId: number, answer: string): Promise<ClarificationDto> {
     const params = new HttpParams().set('projectName', projectName);
     return firstValueFrom(this.http.post<ClarificationDto>(`${this.base}/ideas/clarifications/${clarificationId}/answer`, { answer }, { params }));
+  }
+
+  /** Preview an AI revision without changing the persisted requirement. */
+  async previewBreakdownRevision(projectName: string, ideaId: number, requirementId: number, feedback: string, expectedIdeaVersion: number, expectedRequirementVersion: number): Promise<AiRevisionPreview> {
+    const params = new HttpParams().set('projectName', projectName);
+    return firstValueFrom(this.http.post<AiRevisionPreview>(`${this.base}/ideas/${ideaId}/requirements/${requirementId}/ai-preview`, { feedback, expectedIdeaVersion, expectedRequirementVersion }, { params }));
   }
 
   /** Review breakdown: keep/reject/revise derived requirements (UC-03). */

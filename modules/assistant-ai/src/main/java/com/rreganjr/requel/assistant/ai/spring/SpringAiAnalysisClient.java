@@ -44,6 +44,7 @@ import com.rreganjr.requel.assistant.ai.AiProviderLocality;
 import com.rreganjr.requel.assistant.ai.DataHandlingGuard;
 import com.rreganjr.requel.assistant.ai.AiUsage;
 import com.rreganjr.requel.assistant.ai.ReviewResultMapper;
+import com.rreganjr.requel.assistant.ai.RequirementRevisionResult;
 import com.rreganjr.requel.assistant.ai.ReviewResultMapper.ReviewResult;
 
 /**
@@ -138,6 +139,10 @@ public class SpringAiAnalysisClient implements AiAnalysisClient {
 		log.info("spring-ai request starting for run {} (task {}, provider {}, model {})",
 				request.runId(), request.taskType(), properties.getProvider(), properties.getModel());
 
+		if (RequirementRevisionResult.SCHEMA_NAME.equals(request.outputSchemaName())) {
+			return revision(request, startedAt);
+		}
+
 		ReviewResult result;
 		ChatResponse chatResponse;
 		try {
@@ -166,6 +171,21 @@ public class SpringAiAnalysisClient implements AiAnalysisClient {
 					result.findings() == null ? 0 : result.findings().size());
 		}
 		return toResponse(result, chatResponse, latency);
+	}
+
+	/** Bind the revision schema separately; ReviewResult would discard the revisedShall field. */
+	private AiAnalysisResponse revision(AiAnalysisRequest request, Instant startedAt) throws AiAnalysisException {
+		org.springframework.ai.chat.client.ResponseEntity<ChatResponse, RequirementRevisionResult> reply;
+		try {
+			reply = chat().prompt().system(promptBuilder.instructions(request))
+					.user(promptBuilder.prompt(request)).call().responseEntity(RequirementRevisionResult.class);
+		} catch (RuntimeException e) {
+			throw new AiAnalysisException("Spring AI revision request failed", e);
+		}
+		if (reply == null || reply.entity() == null)
+			throw new AiAnalysisException("Revision reply was empty");
+		Duration latency = Duration.between(startedAt, clock.instant());
+		return reply.entity().toResponse(usage(reply.response(), latency), providerMetadata(reply.response()));
 	}
 
 	// ---- mapping (pure; unit-tested without the network) ------------------

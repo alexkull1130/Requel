@@ -57,6 +57,8 @@ import { AppDataTableComponent } from '../../shared/app-data-table';
 const STALE_VERSION_MESSAGE =
   'This idea was changed elsewhere. Your copy has been refreshed — review the values and continue.';
 
+type AiPreviewRowState = { pending: boolean; error: string | null; suggestion: string | null; projectName: string; requestId: number; ideaId: number; ideaVersion: number; requirementId: number; requirementVersion: number; feedback: string; action: BreakdownAction | undefined; manualText: string; };
+
 @Component({
   changeDetection: ChangeDetectionStrategy.OnPush,
   selector: 'app-idea-editor',
@@ -169,16 +171,44 @@ const STALE_VERSION_MESSAGE =
                 <p-select [(ngModel)]="breakdownDecisions[req.id]" [options]="breakdownActions" optionValue="value"
                           [ariaLabel]="'Decision for ' + req.requirementId" placeholder="Choose action"
                           [disabled]="submittingBreakdown()"
+                          (ngModelChange)="onBreakdownActionChange(req, $event)"
                           [style]="{ width: '10rem' }" />
               </div>
               <div class="breakdown-text">{{ req.shallText }}</div>
               <div class="breakdown-revised" *ngIf="breakdownDecisions[req.id] === 'REVISE'">
                 <textarea pTextarea [(ngModel)]="revisedTexts[req.id]" [disabled]="submittingBreakdown()"
+                          (ngModelChange)="onManualTextChange(req, $event)"
                           [attr.aria-label]="'Revised statement for ' + req.requirementId" rows="2" placeholder="Revised shall statement..."></textarea>
               </div>
               <label [for]="'feedback-' + req.id">Feedback (optional)</label>
-              <textarea pTextarea [id]="'feedback-' + req.id" [(ngModel)]="feedback[req.id]"
+              <textarea pTextarea [id]="'feedback-' + req.id" [(ngModel)]="feedback[req.id]" (ngModelChange)="onFeedbackChange(req, $event)"
                         [disabled]="submittingBreakdown()" rows="2"></textarea>
+              @if (breakdownDecisions[req.id] === 'REVISE') {
+                <p class="text-muted">To ask AI for a revision, enter feedback above. Nothing is saved until you submit the review.</p>
+                <p-button label="Request AI revision" icon="pi pi-refresh" size="small"
+                          [attr.data-testid]="'ai-revision-request-' + req.id"
+                          [disabled]="!canRequestAiRevision(req)" [loading]="isAiPreviewPending(req)"
+                          (onClick)="requestAiRevision(req)" />
+                @if (isAiPreviewPending(req)) {
+                  <p role="status" aria-live="polite">Generating a suggestion. Your edits are preserved.</p>
+                }
+                @if (aiPreviewState(req); as preview) {
+                  @if (preview.error) {
+                    <p class="ai-preview-error" role="alert">{{ preview.error }}</p>
+                  }
+                  @if (preview.suggestion) {
+                    <section class="ai-preview-suggestion" [attr.aria-label]="'AI suggestion for ' + req.requirementId"
+                             [attr.data-testid]="'ai-revision-suggestion-' + req.id" aria-live="polite">
+                      <strong>AI suggestion (not saved)</strong>
+                      <p>{{ preview.suggestion }}</p>
+                      <p-button label="Accept wording" size="small" [disabled]="submittingBreakdown()"
+                                (onClick)="acceptAiSuggestion(req)" />
+                      <p-button label="Discard suggestion" size="small" severity="secondary" [outlined]="true"
+                                [disabled]="submittingBreakdown()" (onClick)="discardAiSuggestion(req)" />
+                    </section>
+                  }
+                }
+              }
             </div>
           }
           <div class="form-actions">
@@ -289,6 +319,10 @@ const STALE_VERSION_MESSAGE =
     .breakdown-item label { display: block; margin-top: 0.75rem; }
     .breakdown-item textarea { width: 100%; }
     .breakdown-revised { margin-top: 0.5rem; }
+    .ai-preview-suggestion { margin-top: 0.75rem; padding: 0.75rem; border-left: 3px solid var(--p-primary-color); background: var(--p-content-hover-background); }
+    .ai-preview-suggestion p { white-space: pre-wrap; }
+    .ai-preview-error { color: var(--p-red-500); margin: 0.5rem 0; }
+    .ai-preview-error button { margin-left: 0.25rem; }
     .derived-card { margin-top: 1.5rem; }
     .req-text-cell { max-width: 40rem; }
     .req-shall-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 0.875rem; }
@@ -325,6 +359,10 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
   breakdownDecisions: Record<number, BreakdownAction> = {};
   feedback: Record<number, string> = {};
   revisedTexts: Record<number, string> = {};
+  private readonly aiPreviewRows = signal<Record<number, AiPreviewRowState>>({});
+  private aiPreviewRequestId = 0;
+  private readonly aiPreviewRequests = signal<Record<number, number>>({});
+  readonly hasPendingAiPreview = computed(() => Object.keys(this.aiPreviewRequests()).length > 0);
   decomposing = signal(false);
   submittingBreakdown = signal(false);
   selectedFile = signal<File | null>(null);
@@ -396,9 +434,76 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
     this.breakdownDecisions = {};
     this.revisedTexts = {};
     this.feedback = {};
+    this.aiPreviewRows.set({});
+    this.aiPreviewRequests.set({});
   }
 
+  private isCurrentAiPreviewRow(row: AiPreviewRowState): boolean {
+    const currentIdea = this.idea();
+    const proposal = currentIdea?.derivedRequirements?.find(req => req.id === row.requirementId);
+    return !!currentIdea && this.projectName === row.projectName && !!currentIdea.canReviewBreakdown && currentIdea.id === row.ideaId && currentIdea.version === row.ideaVersion && proposal?.version === row.requirementVersion && this.breakdownDecisions[row.requirementId] === row.action && (this.feedback[row.requirementId] ?? '').trim() === row.feedback && (this.revisedTexts[row.requirementId] ?? '') === row.manualText;
+  }
+
+  aiPreviewState(req: BreakdownProposal): AiPreviewRowState | null {
+    const row = this.aiPreviewRows()[req.id];
+    return row && this.isCurrentAiPreviewRow(row) ? row : null;
+  }
+
+  private isActiveAiPreviewRequest(row: AiPreviewRowState): boolean {
+    return this.aiPreviewRows()[row.requirementId] === row && this.aiPreviewRequests()[row.requirementId] === row.requestId && this.isCurrentAiPreviewRow(row);
+  }
+
+  isAiPreviewPending(req: BreakdownProposal): boolean { return this.aiPreviewRequests()[req.id] != null; }
+
+  private invalidateAiPreview(requirementId: number): void {
+    const rows = this.aiPreviewRows();
+    if (!(requirementId in rows)) return;
+    const { [requirementId]: discarded, ...remaining } = rows;
+    this.aiPreviewRows.set(remaining);
+  }
+
+  onBreakdownActionChange(req: BreakdownProposal, action: BreakdownAction): void { this.breakdownDecisions[req.id] = action; this.invalidateAiPreview(req.id); }
+  onFeedbackChange(req: BreakdownProposal, value: string): void { this.feedback[req.id] = value; this.invalidateAiPreview(req.id); }
+  onManualTextChange(req: BreakdownProposal, value: string): void { this.revisedTexts[req.id] = value; this.invalidateAiPreview(req.id); }
+
+  canRequestAiRevision(req: BreakdownProposal): boolean {
+    return !!this.idea()?.canReviewBreakdown && this.breakdownDecisions[req.id] === 'REVISE' && !!this.feedback[req.id]?.trim() && !this.submittingBreakdown() && !this.isAiPreviewPending(req);
+  }
+
+  async requestAiRevision(req: BreakdownProposal): Promise<void> {
+    if (!this.canRequestAiRevision(req)) return;
+    const currentIdea = this.idea(); if (!currentIdea) return;
+    const row: AiPreviewRowState = { pending: true, error: null, suggestion: null, projectName: this.projectName, requestId: ++this.aiPreviewRequestId, ideaId: currentIdea.id, ideaVersion: currentIdea.version, requirementId: req.id, requirementVersion: req.version, feedback: this.feedback[req.id].trim(), action: this.breakdownDecisions[req.id], manualText: this.revisedTexts[req.id] ?? '' };
+    this.aiPreviewRequests.update(requests => ({ ...requests, [req.id]: row.requestId }));
+    this.aiPreviewRows.update(rows => ({ ...rows, [req.id]: row }));
+    try {
+      const preview = await this.requirementService.previewBreakdownRevision(this.projectName, row.ideaId, row.requirementId, row.feedback, row.ideaVersion, row.requirementVersion);
+      if (!this.isActiveAiPreviewRequest(row)) return;
+      if (preview.ideaVersion !== row.ideaVersion || preview.requirementVersion !== row.requirementVersion) { this.invalidateAiPreview(req.id); return; }
+      this.aiPreviewRows.update(rows => ({ ...rows, [req.id]: { ...row, pending: false, suggestion: preview.revisedShall } }));
+    } catch (e: any) {
+      if (!this.isActiveAiPreviewRequest(row)) return;
+      this.aiPreviewRows.update(rows => ({ ...rows, [req.id]: { ...row, pending: false, error: 'AI revision could not be generated: ' + (e.error?.message ?? e.message ?? 'Please try again.') } }));
+    } finally {
+      if (this.aiPreviewRequests()[req.id] === row.requestId) {
+        const { [req.id]: finishedRequest, ...remaining } = this.aiPreviewRequests();
+        this.aiPreviewRequests.set(remaining);
+      }
+    }
+  }
+
+  acceptAiSuggestion(req: BreakdownProposal): void {
+    const row = this.aiPreviewState(req);
+    if (!row?.suggestion || row.pending || !this.idea()?.canReviewBreakdown || this.submittingBreakdown()) return;
+    this.revisedTexts[req.id] = row.suggestion;
+    this.invalidateAiPreview(req.id);
+  }
+
+  discardAiSuggestion(req: BreakdownProposal): void { this.invalidateAiPreview(req.id); }
+
   ngOnDestroy(): void {
+    this.aiPreviewRows.set({});
+    this.aiPreviewRequests.set({});
     if (this.ideaId) {
       void this.eventStreamService.removeSubscription('Idea', this.ideaId);
     }
@@ -601,11 +706,12 @@ export class IdeaEditorComponent implements OnInit, OnDestroy, DirtyCheckable {
 
   rejectAll(): void {
     for (const draft of this.derivedRequirements()) this.breakdownDecisions[draft.id] = 'REJECT';
+    this.aiPreviewRows.set({});
   }
 
   canSubmitBreakdown(): boolean {
     const drafts = this.derivedRequirements();
-    return !!this.idea()?.canReviewBreakdown && !this.submittingBreakdown() && drafts.length > 0
+    return !!this.idea()?.canReviewBreakdown && !this.submittingBreakdown() && !this.hasPendingAiPreview() && drafts.length > 0
       && drafts.every(({ id }) => this.breakdownDecisions[id]
         && (this.breakdownDecisions[id] !== 'REVISE' || !!this.revisedTexts[id]?.trim()));
   }

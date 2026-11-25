@@ -46,7 +46,8 @@ class RequirementControllerTest {
     }
 
     private RequirementController controller(boolean member, IdeaGenerationService genService) {
-        var c = new RequirementController(projects, users, genService);
+        var c = new RequirementController(projects, users, genService,
+            mock(RequirementAiPreviewService.class), null);
         ReflectionTestUtils.setField(c, "em", em);
         when(projects.findProjectByName("alpha")).thenReturn(project);
         when(users.resolve()).thenReturn(user);

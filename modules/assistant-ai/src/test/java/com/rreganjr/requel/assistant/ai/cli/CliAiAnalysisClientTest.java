@@ -58,6 +58,8 @@ class CliAiAnalysisClientTest {
 			+ "\"evidenceReferences\":[\"fast\"],\"suggestedIssueText\":\"'fast' is vague\","
 			+ "\"suggestedNoteText\":null,\"suggestedPositions\":[\"Set a latency budget\"]}]}";
 
+	private static final String REVISION_REPLY = "{\"revisedShall\":\"The system shall confirm each booking.\"}";
+
 	private static final Map<String, Object> ALLOWED = Map.of("externalProviderAllowed", true);
 
 	private final ObjectMapper objectMapper = new ObjectMapper();
@@ -95,6 +97,16 @@ class CliAiAnalysisClientTest {
 				"RequirementsReviewOutput", "1",
 				objectMapper.createObjectNode().put("type", "object"), ALLOWED, Map.of(),
 				"Review the goal.");
+	}
+
+	private AiAnalysisRequest revisionRequest() {
+		return new AiAnalysisRequest("ai-idea-to-requirements", UUID.randomUUID(),
+				"IDEA_TO_REQUIREMENTS", EntityRef.of("Project", 2L), EntityRef.of("Project", 2L),
+				Locale.US, List.of(Map.of("ideaText", "Bookings", "requirementShall",
+						"The system shall book classes.", "feedback", "Confirm the booking.")),
+				"RequirementRevisionPreviewOutput", "1",
+				objectMapper.createObjectNode().put("type", "object"), ALLOWED, Map.of(),
+				"Revise only the supplied requirement.");
 	}
 
 	private static String envelope(String result) throws Exception {
@@ -236,6 +248,55 @@ class CliAiAnalysisClientTest {
 		assertThat(response.usage().inputTokens()).isNull();
 		assertThat(response.usage().costEstimate()).isNull();
 		assertThat(response.usage().latency()).isNotNull();
+	}
+
+	@Test
+	void rawRevisionOutputUsesTheDedicatedRevisionParser() throws Exception {
+		cli.setOutputFormat(CliAiProperties.OutputFormat.RAW);
+		runner.stdout = "```json\n" + REVISION_REPLY + "\n```";
+
+		AiAnalysisResponse response = client().analyze(revisionRequest());
+
+		assertThat(response.structuredOutput().path("revisedShall").asText())
+				.isEqualTo("The system shall confirm each booking.");
+		assertThat(response.findings()).isEmpty();
+		assertThat(response.usage().inputTokens()).isNull();
+	}
+
+	@Test
+	void claudeEnvelopeRevisionOutputPreservesEnvelopeUsageAndMetadata() throws Exception {
+		runner.stdout = envelope("```json\n" + REVISION_REPLY + "\n```");
+
+		AiAnalysisResponse response = client().analyze(revisionRequest());
+
+		assertThat(response.structuredOutput().path("revisedShall").asText())
+				.isEqualTo("The system shall confirm each booking.");
+		assertThat(response.usage().inputTokens()).isEqualTo(2000);
+		assertThat(response.providerMetadata()).containsEntry("outputFormat", "CLAUDE_JSON")
+				.containsEntry("exitCode", 0);
+	}
+
+	@Test
+	void malformedOrBlankRevisionOutputIsRejected() {
+		cli.setOutputFormat(CliAiProperties.OutputFormat.RAW);
+		for (String reply : List.of("not json", "{\"revisedShall\":\"  \"}")) {
+			runner.stdout = reply;
+			assertThatThrownBy(() -> client().analyze(revisionRequest()))
+					.isInstanceOf(AiAnalysisException.class);
+		}
+	}
+
+	@Test
+	void revisionRequestIsRefusedWhenExternalProvidersAreDisallowed() {
+		AiAnalysisRequest denied = new AiAnalysisRequest("ai-idea-to-requirements",
+				UUID.randomUUID(), "IDEA_TO_REQUIREMENTS", EntityRef.of("Project", 2L),
+				EntityRef.of("Project", 2L), Locale.US, List.of(),
+				"RequirementRevisionPreviewOutput", "1", objectMapper.createObjectNode(),
+				Map.of("externalProviderAllowed", false), Map.of());
+
+		assertThatThrownBy(() -> client().analyze(denied)).isInstanceOf(AiAnalysisException.class)
+				.hasMessageContaining("egress.external");
+		assertThat(runner.last).isNull();
 	}
 
 	@Test

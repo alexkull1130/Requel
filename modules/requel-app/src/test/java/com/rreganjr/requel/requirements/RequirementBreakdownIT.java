@@ -71,10 +71,28 @@ class RequirementBreakdownIT extends AbstractIntegrationTestCase {
         var drafts = rows(review);
         assertEquals(3, drafts.size());
         assertEquals(3, drafts.stream().map(r -> r.get("requirementId")).distinct().count());
+        // A revision preview must call AI outside a DB transaction and leave every draft untouched.
+        org.mockito.Mockito.when(provider.analyze(org.mockito.ArgumentMatchers.any())).thenAnswer(invocation -> {
+            assertFalse(org.springframework.transaction.support.TransactionSynchronizationManager
+                .isActualTransactionActive());
+            return new AiAnalysisResponse("Revised wording",
+                new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode()
+                    .put("revisedShall", "The system shall export signed XML."),
+                List.of(), List.of(), AiUsage.noop("fixture", Duration.ZERO), Map.of());
+        });
+        var selected = drafts.get(2);
+        var preview = controller.previewRevision(name, id, (Long) selected.get("id"),
+            new RequirementController.RevisionPreviewRequest("Require signed XML",
+                (Long) review.get("version"), (Long) selected.get("version")));
+        assertEquals("The system shall export signed XML.", preview.revisedShall());
+        var afterPreview = controller.getIdea(name, id);
+        assertEquals(review.get("version"), afterPreview.get("version"));
+        assertEquals(drafts, rows(afterPreview));
+        assertEquals(Idea.Status.BREAKDOWN_REVIEW, afterPreview.get("status"));
         var actions = List.of(BreakdownAction.KEEP, BreakdownAction.REJECT, BreakdownAction.REVISE);
         var decisions = java.util.stream.IntStream.range(0, drafts.size()).mapToObj(index ->
             new RequirementController.Decision((Long) drafts.get(index).get("id"), actions.get(index),
-                index == 2 ? "The system shall export signed XML." : null,
+                index == 2 ? preview.revisedShall() : null,
                 "Comment " + index, (Long) drafts.get(index).get("version"))).toList();
         controller.reviewBreakdown(name, id, new RequirementController.BreakdownReview(decisions));
 

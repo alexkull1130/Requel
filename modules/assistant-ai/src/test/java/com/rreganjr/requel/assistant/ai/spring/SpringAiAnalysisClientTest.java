@@ -148,4 +148,54 @@ class SpringAiAnalysisClientTest {
 		assertThatThrownBy(() -> client.analyze(local)).isInstanceOf(AiAnalysisException.class)
 				.hasMessageContaining("Spring AI chat request failed");
 	}
+
+	private AiAnalysisRequest revisionRequest(boolean allowed) {
+		return new AiAnalysisRequest("ai-idea-to-requirements", UUID.randomUUID(), "IDEA_TO_REQUIREMENTS",
+			EntityRef.of("Project", 3L), EntityRef.of("Project", 3L), Locale.US,
+			List.of(Map.of("ideaText", "Exports", "requirementShall", "Export CSV", "feedback", "Sign it")),
+			com.rreganjr.requel.assistant.ai.RequirementRevisionResult.SCHEMA_NAME, "1",
+			objectMapper.createObjectNode(), Map.of("externalProviderAllowed", allowed), Map.of(), "Revise one statement");
+	}
+
+	private ChatClient.CallResponseSpec stubCall() {
+		var prompt = org.mockito.Mockito.mock(ChatClient.ChatClientRequestSpec.class, org.mockito.Mockito.RETURNS_SELF);
+		var call = org.mockito.Mockito.mock(ChatClient.CallResponseSpec.class);
+		org.mockito.Mockito.when(chat.prompt()).thenReturn(prompt);
+		org.mockito.Mockito.when(prompt.call()).thenReturn(call);
+		return call;
+	}
+
+	@Test
+	void actualRevisionCallBindsRevisionOutputRatherThanReviewFindings() throws Exception {
+		var call = stubCall();
+		org.mockito.Mockito.when(call.responseEntity(com.rreganjr.requel.assistant.ai.RequirementRevisionResult.class))
+			.thenReturn(new org.springframework.ai.chat.client.ResponseEntity<>(null,
+				new com.rreganjr.requel.assistant.ai.RequirementRevisionResult("The system shall export signed CSV.")));
+		var response = client.analyze(revisionRequest(true));
+		assertThat(response.structuredOutput().path("revisedShall").asText()).isEqualTo("The system shall export signed CSV.");
+		assertThat(response.findings()).isEmpty();
+		assertThat(response.usage().provider()).isEqualTo("openai");
+		org.mockito.Mockito.verify(call, org.mockito.Mockito.never()).responseEntity(ReviewResult.class);
+	}
+
+	@Test
+	void revisionRequestsStillRequireEgressPermissionBeforeCallingSpringAI() {
+		assertThatThrownBy(() -> client.analyze(revisionRequest(false))).isInstanceOf(AiAnalysisException.class)
+			.hasMessageContaining("does not allow");
+		verifyNoInteractions(chat);
+	}
+
+	@Test
+	void actualRevisionCallRejectsBlankOutputAndReportsTransportFailures() {
+		var call = stubCall();
+		org.mockito.Mockito.when(call.responseEntity(com.rreganjr.requel.assistant.ai.RequirementRevisionResult.class))
+			.thenReturn(new org.springframework.ai.chat.client.ResponseEntity<>(null,
+				new com.rreganjr.requel.assistant.ai.RequirementRevisionResult(" ")));
+		assertThatThrownBy(() -> client.analyze(revisionRequest(true))).isInstanceOf(AiAnalysisException.class)
+			.hasMessageContaining("nonblank");
+		org.mockito.Mockito.when(call.responseEntity(com.rreganjr.requel.assistant.ai.RequirementRevisionResult.class))
+			.thenThrow(new IllegalStateException("offline"));
+		assertThatThrownBy(() -> client.analyze(revisionRequest(true))).isInstanceOf(AiAnalysisException.class)
+			.hasMessageContaining("revision request failed");
+	}
 }

@@ -4,6 +4,10 @@ import com.rreganjr.platform.command.AuthorizationException;
 import com.rreganjr.requel.assistant.ai.IdeaGenerationService;
 import com.rreganjr.requel.assistant.ai.IdeaToRequirementsService;
 import com.rreganjr.requel.assistant.api.UserRef;
+import com.rreganjr.requel.assistant.api.AssistantContext;
+import com.rreganjr.requel.assistant.api.AssistantException;
+import com.rreganjr.requel.assistant.api.EntityRef;
+import com.rreganjr.requel.assistant.ai.IdeaToRequirements;
 import com.rreganjr.requel.project.*;
 import com.rreganjr.requel.project.Requirement.*;
 import com.rreganjr.requel.project.impl.IdeaImpl;
@@ -17,6 +21,7 @@ import com.rreganjr.requel.user.WorkflowRole;
 import com.rreganjr.requel.user.impl.SystemAdminUserRole;
 import jakarta.persistence.*;
 import java.time.Instant;
+import java.time.Clock;
 import java.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,6 +29,7 @@ import org.springframework.lang.Nullable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
@@ -38,12 +44,18 @@ public class RequirementController {
     private final ProjectRepository projects;
     private final CurrentUserResolver users;
     private final IdeaGenerationService ideaGenerationService;
+    private final RequirementAiPreviewService aiPreviews;
+    private final IdeaToRequirementsService ideaAi;
 
+    /** Wire review persistence and the separate short-transaction/AI preview boundaries. */
     public RequirementController(ProjectRepository projects, CurrentUserResolver users,
-            @Nullable IdeaGenerationService ideaGenerationService) {
+            @Nullable IdeaGenerationService ideaGenerationService,
+            RequirementAiPreviewService aiPreviews, @Nullable IdeaToRequirementsService ideaAi) {
         this.projects = projects;
         this.users = users;
         this.ideaGenerationService = ideaGenerationService;
+        this.aiPreviews = aiPreviews;
+        this.ideaAi = ideaAi;
     }
     public record Create(Long ideaId, String shallText, String requirementId) { }
     public record Edit(String shallText, Long version, String requirementId) { }
@@ -54,6 +66,10 @@ public class RequirementController {
     public record Decision(Long requirementId, BreakdownAction action, String revisedText, String feedback, Long version) { }
     /** Complete set of decisions for one idea. */
     public record BreakdownReview(List<Decision> decisions) { }
+    /** Feedback and optimistic versions for a nonpersistent AI revision request. */
+    public record RevisionPreviewRequest(String feedback, Long expectedIdeaVersion, Long expectedRequirementVersion) { }
+    /** Generated wording and the versions it was based on; accepting it is still a local UI action. */
+    public record RevisionPreview(String revisedShall, long ideaVersion, long requirementVersion) { }
     private record Caller(Project project, User user) { }
 
     private Caller caller(String name, String permission, Class<?> type) {
@@ -246,6 +262,39 @@ public class RequirementController {
         em.flush();
         audit(c, "SubmitWorkflowIdea", i.getId());
         return ideaView(c, i);
+    }
+
+    /**
+     * Preview a single proposal revision without modifying its text or any review decision.
+     * The endpoint suspends ambient transactions; validation happens through a separate bean's
+     * short read-only transaction, which finishes before the slow provider call begins.
+     */
+    @PostMapping("/ideas/{ideaId}/requirements/{requirementId}/ai-preview")
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public RevisionPreview previewRevision(@RequestParam String projectName, @PathVariable long ideaId,
+            @PathVariable long requirementId, @RequestBody RevisionPreviewRequest body) {
+        if (body == null) throw new IllegalArgumentException("Revision feedback and versions are required.");
+        var snapshot = aiPreviews.snapshot(projectName, ideaId, requirementId, body.feedback(),
+            body.expectedIdeaVersion(), body.expectedRequirementVersion());
+        if (ideaAi == null) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+            "AI revision is not enabled. Your review is unchanged; you can still edit the wording manually.");
+        UserRef user = new UserRef(snapshot.userId(), snapshot.username());
+        AssistantContext context = new AssistantContext(UUID.randomUUID(), user, user,
+            EntityRef.of("Project", snapshot.projectId()), IdeaToRequirements.TASK_TYPE,
+            Locale.ROOT, Clock.systemUTC(), Map.of("ideaId", snapshot.ideaId(),
+                "requirementId", snapshot.requirementId()));
+        String revised;
+        try {
+            revised = ideaAi.previewRevision(context, snapshot.ideaText(), snapshot.shallText(), snapshot.feedback());
+        } catch (AssistantException e) {
+            log.warn("AI revision failed for idea {} requirement {}", ideaId, requirementId, e);
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                "AI revision could not be generated. Your review is unchanged. Try again or edit the wording manually.");
+        }
+        // Refuse a preview if ownership, permissions, state or versions changed during generation.
+        aiPreviews.snapshot(projectName, ideaId, requirementId, body.feedback(),
+            body.expectedIdeaVersion(), body.expectedRequirementVersion());
+        return new RevisionPreview(revised, snapshot.ideaVersion(), snapshot.requirementVersion());
     }
 
     /** Apply the PM's decisions and complete the idea in the same transaction as the audit. */

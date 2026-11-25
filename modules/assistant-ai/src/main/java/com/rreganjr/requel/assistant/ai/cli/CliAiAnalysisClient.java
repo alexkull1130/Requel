@@ -52,6 +52,7 @@ import com.rreganjr.requel.assistant.ai.AiProperties;
 import com.rreganjr.requel.assistant.ai.AiProviderLocality;
 import com.rreganjr.requel.assistant.ai.DataHandlingGuard;
 import com.rreganjr.requel.assistant.ai.AiUsage;
+import com.rreganjr.requel.assistant.ai.RequirementRevisionResult;
 import com.rreganjr.requel.assistant.ai.ReviewResultMapper;
 import com.rreganjr.requel.assistant.ai.ReviewResultMapper.ReviewResult;
 
@@ -125,12 +126,17 @@ public class CliAiAnalysisClient implements AiAnalysisClient {
 			case RAW -> new Decoded(stdout, null, null, null, null);
 		};
 
-		ReviewResult review = mapper.parse(decoded.reply());
-		ReviewResultMapper.validate(review);
 		Duration latency = Duration.between(startedAt, clock.instant());
 		AiUsage usage = new AiUsage(aiProperties.getProvider(), aiProperties.getModel(),
 				decoded.inputTokens(), decoded.outputTokens(), decoded.cachedInputTokens(), latency,
 				decoded.cost());
+		if (RequirementRevisionResult.SCHEMA_NAME.equals(request.outputSchemaName())) {
+			return RequirementRevisionResult.parse(decoded.reply(), objectMapper).toResponse(usage,
+					metadata(result));
+		}
+
+		ReviewResult review = mapper.parse(decoded.reply());
+		ReviewResultMapper.validate(review);
 		if (log.isDebugEnabled()) {
 			log.debug("cli provider reply for run {} ({} findings, {} ms)", request.runId(),
 					review.findings() == null ? 0 : review.findings().size(), latency.toMillis());
