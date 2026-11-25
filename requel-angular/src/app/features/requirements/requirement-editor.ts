@@ -18,7 +18,7 @@
  * along with Requel. If not, see <http://www.gnu.org/licenses/>.
  *
  */
-import { ChangeDetectionStrategy, Component, computed, DestroyRef, inject, OnDestroy, OnInit, signal, ViewChild } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, DestroyRef, effect, inject, OnDestroy, OnInit, signal, ViewChild } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { NgIf, NgTemplateOutlet } from '@angular/common';
 import { DatePipe } from '@angular/common';
@@ -300,6 +300,11 @@ const STALE_VERSION_MESSAGE =
 
       <!-- Shared templates -->
       <ng-template #detailsFields>
+        @if (detailsLocked()) {
+          <p class="text-muted" data-testid="req-details-locked">
+            This requirement is approved or published, so its details are read-only.
+          </p>
+        }
         <app-field label="Requirement ID" helper="Auto-generated if left blank."
                    [control]="detailsForm.controls.requirementId"
                    [submitted]="submitted()">
@@ -423,6 +428,11 @@ export class RequirementEditorComponent implements OnInit, OnDestroy, DirtyCheck
   readonly reqStatus = computed(() => this.requirement()?.status ?? 'DRAFT');
   readonly allReviewsPassed = computed(() => this.requirement()?.allReviewsPassed ?? false);
   readonly canEdit = computed(() => this.permissionService.canEdit('Requirement'));
+  readonly detailsLocked = computed(() => {
+    const status = this.requirement()?.status;
+    return status === 'APPROVED' || status === 'PUBLISHED';
+  });
+  readonly detailsEditable = computed(() => !this.detailsLocked());
   readonly canDelete = computed(() => this.permissionService.canDelete('Requirement'));
 
   readonly comparisonColumns: any[] = [
@@ -446,6 +456,16 @@ export class RequirementEditorComponent implements OnInit, OnDestroy, DirtyCheck
       command: (c: any) => this.viewComparison(c)
     }
   ];
+
+  constructor() {
+    effect(() => {
+      if (this.detailsLocked()) {
+        this.detailsForm.disable({ emitEvent: false });
+      } else {
+        this.detailsForm.enable({ emitEvent: false });
+      }
+    });
+  }
 
   ngOnInit(): void {
     this.route.paramMap.pipe(takeUntilDestroyed(this.destroyRef)).subscribe(async params => {
@@ -544,10 +564,14 @@ export class RequirementEditorComponent implements OnInit, OnDestroy, DirtyCheck
   }
 
   canSave(): boolean {
-    return this.detailsForm.valid && this.detailsForm.dirty && !this.saving();
+    return this.canEdit() && this.detailsEditable() && this.detailsForm.valid && this.detailsForm.dirty && !this.saving();
   }
 
   async onStepCommit(request: WizardCommitRequest): Promise<void> {
+    if (!this.canEdit() || !this.detailsEditable()) {
+      request.fail('This requirement is read-only and cannot be saved.');
+      return;
+    }
     if (request.step.key !== 'details') {
       request.complete();
       return;
@@ -574,6 +598,9 @@ export class RequirementEditorComponent implements OnInit, OnDestroy, DirtyCheck
   }
 
   private async saveDetails(): Promise<CommandResult<unknown>> {
+    if (!this.canEdit() || !this.detailsEditable()) {
+      return { success: false, entityType: 'Requirement', entity: null, error: 'This requirement is read-only and cannot be saved.', violations: null };
+    }
     this.saving.set(true);
     this.showError(null);
     try {
@@ -614,6 +641,7 @@ export class RequirementEditorComponent implements OnInit, OnDestroy, DirtyCheck
   }
 
   async onSave(): Promise<void> {
+    if (!this.canEdit() || !this.detailsEditable() || this.saving()) return;
     this.submitted.set(true);
     if (this.detailsForm.invalid) { this.detailsForm.markAllAsTouched(); return; }
     const result = await this.saveDetails();

@@ -252,6 +252,53 @@ class RequirementControllerTest {
         verify(em).persist(any(CommandAuditLog.class));
     }
 
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = Status.class, names = {"APPROVED", "PUBLISHED"})
+    void protectedRequirementsRejectHttpEditsWithoutChangingState(Status status) throws Exception {
+        var c = controller(true);
+        var r = requirementInProject();
+        r.setRequirementCode("REQ-ORIGINAL");
+        for (Department department : Department.values())
+            r.review(department, Result.PASSED, "Reviewed", "reviewer", "Reviewer");
+        r.approve();
+        if (status == Status.PUBLISHED) ReflectionTestUtils.setField(r, "status", status);
+        var before = c.get("alpha", 7);
+        var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(c).build();
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put("/api/requirements/7")
+            .param("projectName", "alpha").contentType("application/json")
+            .content("{\"shallText\":\"A changed statement\",\"requirementId\":\"REQ-CHANGED\",\"version\":0}"))
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isConflict())
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.message")
+                .value(org.hamcrest.Matchers.containsString("read-only")));
+        // An ID-only/no-op wording request must not evade the same guard.
+        assertThrows(IllegalStateException.class, () -> c.edit("alpha", 7,
+            new RequirementController.Edit(r.getShallText(), 0L, "REQ-CHANGED")));
+        assertEquals(before, c.get("alpha", 7));
+        assertTrue(r.allReviewsPassed());
+        verify(em, never()).persist(any());
+        verify(em, never()).flush();
+    }
+
+    @Test void ordinaryDraftEditsAndExplicitlyReopenedEditsStillWork() {
+        var c = controller(true);
+        when(user.getWorkflowRole()).thenReturn(WorkflowRole.PRODUCT_MANAGER);
+        var r = requirementInProject();
+        c.edit("alpha", 7, new RequirementController.Edit("The system shall export CSV.", 0L, "REQ-CSV"));
+        assertEquals("The system shall export CSV.", r.getShallText());
+        assertEquals("REQ-CSV", r.getRequirementCode());
+        for (Department department : Department.values())
+            r.review(department, Result.PASSED, "Reviewed", "reviewer", "Reviewer");
+        r.approve();
+        assertThrows(IllegalStateException.class, () -> c.edit("alpha", 7,
+            new RequirementController.Edit("The system shall export signed CSV.", 0L, "REQ-SIGNED")));
+        c.reopen("alpha", 7, new RequirementController.Version(0L));
+        c.edit("alpha", 7, new RequirementController.Edit("The system shall export signed CSV.", 0L, "REQ-SIGNED"));
+        assertEquals(Status.DRAFT, r.getStatus());
+        assertEquals("REQ-SIGNED", r.getRequirementCode());
+        assertEquals("The system shall export signed CSV.", r.getShallText());
+        assertTrue(r.getReviews().isEmpty());
+    }
+
     private RequirementImpl requirementInProject() {
         var requirement = new RequirementImpl(1L, null, "The system shall export.", "author");
         ReflectionTestUtils.setField(requirement, "id", 7L);

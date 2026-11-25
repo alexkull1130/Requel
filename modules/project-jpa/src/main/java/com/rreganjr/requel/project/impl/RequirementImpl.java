@@ -40,8 +40,9 @@ public class RequirementImpl implements Requirement {
         if (text == null || text.isBlank()) throw new IllegalArgumentException("A requirement needs a shall statement.");
         return text.strip();
     }
+    /** Change unapproved wording only; approved content must be explicitly reopened first. */
     public void revise(String text) {
-        if (status == Status.PUBLISHED) throw new IllegalStateException("Published requirements cannot be edited.");
+        requireEditable();
         String next = validated(text);
         if (!next.equals(shallText)) {
             shallText = next;
@@ -102,12 +103,20 @@ public class RequirementImpl implements Requirement {
     public Instant getUpdatedAt() { return updatedAt; }
     public Map<Department, Review> getReviews() { return Collections.unmodifiableMap(reviews); }
     public String getRequirementCode() { return requirementCode == null ? "REQ-" + id : requirementCode; }
+    /** Keep the human-readable ID immutable while the requirement is approved or published. */
     public void setRequirementCode(String value) {
+        requireEditable();
         if (value != null && !value.isBlank()) {
             if (value.strip().length() > 255) throw new IllegalArgumentException("Requirement ID is too long.");
-            if (status == Status.PUBLISHED) throw new IllegalStateException("Published requirements cannot be edited.");
             requirementCode = value.strip();
         }
+    }
+
+    private void requireEditable() {
+        if (status == Status.APPROVED)
+            throw new IllegalStateException("Approved requirements are read-only. Reopen for review before editing.");
+        if (status == Status.PUBLISHED)
+            throw new IllegalStateException("Published requirements are read-only and cannot be edited.");
     }
 
     @Embeddable
